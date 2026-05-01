@@ -18,6 +18,7 @@ export default function App() {
       mode: 'object',
       target: '',
       threshold: 'strict',
+      ocrMode: 'fast',
       referenceImage: null
     };
   });
@@ -62,6 +63,7 @@ export default function App() {
           vision={vision}
           ocr={ocr}
           onExit={stopScan}
+          onSessionChange={setSession}
         />
       )}
     </div>

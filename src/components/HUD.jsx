@@ -7,7 +7,15 @@ const MODE_LABEL = {
   auto: 'Auto / Hybrid'
 };
 
-export default function HUD({ session, onExit, locked }) {
+export default function HUD({
+  session,
+  onExit,
+  locked,
+  ocrMode,
+  ocrLoading,
+  showOcrToggle,
+  onToggleOcrMode
+}) {
   const t = THRESHOLDS[session.threshold];
   const target = session.mode === 'reference' && !session.target
     ? (session.referenceImage?.name || 'Reference image')
@@ -24,6 +32,16 @@ export default function HUD({ session, onExit, locked }) {
           {locked && <span className="hud-pill lock">LOCKED</span>}
         </div>
       </div>
+      {showOcrToggle && (
+        <button
+          className={`hud-toggle ${ocrMode === 'fast' ? 'is-fast' : 'is-accurate'} ${ocrLoading ? 'is-loading' : ''}`}
+          onClick={onToggleOcrMode}
+          disabled={ocrLoading}
+          aria-label="Toggle OCR engine"
+        >
+          {ocrLoading ? '…' : (ocrMode === 'fast' ? 'Fast' : 'Accurate')}
+        </button>
+      )}
     </div>
   );
 }
