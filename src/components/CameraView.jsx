@@ -6,13 +6,20 @@ import { OffFrameTracker } from '../utils/tracking.js';
 import { THRESHOLDS } from '../utils/thresholdMap.js';
 import { imageDataFromBlob } from '../utils/imageData.js';
 
-const VISION_INTERVAL = 250;     // ms between TF.js detections
-const OCR_INTERVAL_FAST = 500;   // ~2 fps for OEM 0 + center-crop
+const VISION_INTERVAL = 250;        // ms between TF.js detections
+const OCR_INTERVAL_FAST = 500;      // ~2 fps for OEM 0 + center-crop
 const OCR_INTERVAL_ACCURATE = 1200; // ~0.8 fps for OEM 1 LSTM full frame
 
 // Fast-mode crop: 60% width × 70% height of the camera frame, centered.
 const CROP_W_FRACTION = 0.6;
 const CROP_H_FRACTION = 0.7;
+
+// How many consecutive scans without seeing the target before the match
+// panel auto-clears. (Spec: clear after >2 consecutive misses.)
+const MAX_MISSES = 2;
+
+// How long the green "detected" dot flash lasts.
+const DETECTED_FLASH_MS = 400;
 
 export default function CameraView({ session, vision, ocr, onExit, onSessionChange }) {
   const videoRef = useRef(null);
@@ -32,21 +39,28 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
     arrow: null,
     fps: 0,
     lastDrawT: performance.now(),
-    drawCount: 0
+    drawCount: 0,
+    objectMisses: 0,
+    ocrMisses: 0,
+    detectedFlashUntil: 0
   });
 
   const [match, setMatch] = useState(null);
-  const [paused, setPaused] = useState(false);
   const [fps, setFps] = useState(0);
   const [status, setStatus] = useState('Initializing camera…');
   const [ocrLoading, setOcrLoading] = useState(false);
-  const pausedRef = useRef(false);
-  pausedRef.current = paused;
+  // 'idle' | 'processing' | 'detected'
+  const [ocrStatus, setOcrStatus] = useState('idle');
 
   const { error, ready: camReady } = useCamera(videoRef);
 
   const threshold = THRESHOLDS[session.threshold] || THRESHOLDS.strict;
   const ocrMode = session.ocrMode || 'fast';
+
+  // The user-facing percentage (Exact 100% / Strict 90% / Loose 70% /
+  // Similar 50%) is the literal display gate — only matches whose confidence
+  // meets or exceeds this percentage are surfaced in the match panel.
+  const displayThreshold = threshold.pct / 100;
 
   // Push reference image into vision worker on mount.
   useEffect(() => {
@@ -64,14 +78,11 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
     }
   }, [vision, session.mode, session.referenceImage]);
 
-  // Notify OCR worker when fast/accurate mode changes (after first init).
+  // Notify OCR worker when fast/accurate mode changes.
   const ocrModeInitialized = useRef(false);
   useEffect(() => {
     if (!ocr) return;
     if (!ocrModeInitialized.current) {
-      // First mount: useWorkers already sent default 'init'. We still need
-      // the OCR worker on the right ocrMode. Send setMode if it differs from
-      // the default 'fast'.
       ocrModeInitialized.current = true;
       if (ocrMode !== 'fast') {
         setOcrLoading(true);
@@ -110,6 +121,12 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
       ocrBusyRef.current = false;
       stateRef.current.ocrLines = m.lines || [];
       stateRef.current.ocrWords = m.words || [];
+      // Any successfully read text triggers a brief green "detected" flash on
+      // the HUD status dot. The dot drops back to processing / idle after the
+      // flash window expires (see updateOcrStatus).
+      if (stateRef.current.ocrWords.length > 0) {
+        stateRef.current.detectedFlashUntil = performance.now() + DETECTED_FLASH_MS;
+      }
       handleOcrResult(m);
     };
 
@@ -132,18 +149,19 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
     };
     animRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animRef.current);
-  }, [camReady, session, paused]);
+  }, [camReady, session]);
 
   function handleVisionResult(m) {
     const wantObject = session.mode === 'object' || session.mode === 'auto';
     const wantReference = session.mode === 'reference';
+    if (!wantObject && !wantReference) return;
 
     let best = null;
 
     if (wantObject) {
       const candidates = (m.objects || []).filter((o) => {
         if (m.targetClasses?.length && !o.classMatch) return false;
-        return o.score >= threshold.conf;
+        return o.score >= displayThreshold;
       });
       candidates.sort((a, b) => b.score - a.score);
       const top = candidates[0];
@@ -162,7 +180,7 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
 
     if (wantReference && m.referenceMatch) {
       const r = m.referenceMatch;
-      if (r.score >= threshold.color) {
+      if (r.score >= displayThreshold) {
         const candidate = {
           bbox: r.bbox,
           frameW: m.width,
@@ -177,53 +195,80 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
     }
 
     if (best) {
+      stateRef.current.objectMisses = 0;
       stateRef.current.matchedBox = best;
       trackerRef.current.update(best.bbox);
-      maybeRaiseMatch(best);
+      setMatch(best);
     } else {
-      // Don't clobber a recent OCR text match — only clear our object/ref slot.
-      const cur = stateRef.current.matchedBox;
-      if (cur && (cur.source === 'object' || cur.source === 'reference')) {
-        stateRef.current.matchedBox = null;
-      }
+      stateRef.current.objectMisses += 1;
+      maybeClearStaleMatch();
     }
   }
 
   function handleOcrResult(m) {
-    if (session.mode !== 'label' && session.mode !== 'auto') return;
-    if (!m.match) return;
-    if (m.match.confidence < threshold.conf) return;
+    const wantOcr = session.mode === 'label' || session.mode === 'auto';
+    if (!wantOcr) return;
 
-    const matchedBox = m.match.bbox
-      ? {
-          bbox: m.match.bbox,
-          frameW: m.width,
-          frameH: m.height,
-          confidence: m.match.confidence,
-          label: `“${m.match.text}”`,
-          subtitle: 'Text matched',
-          source: 'ocr'
-        }
-      : null;
+    const hasMatch = m.match && m.match.confidence >= displayThreshold;
+    if (hasMatch) {
+      stateRef.current.detectedFlashUntil = performance.now() + DETECTED_FLASH_MS;
+      const matchedBox = m.match.bbox
+        ? {
+            bbox: m.match.bbox,
+            frameW: m.width,
+            frameH: m.height,
+            confidence: m.match.confidence,
+            label: `“${m.match.text}”`,
+            subtitle: 'Text matched',
+            source: 'ocr'
+          }
+        : {
+            bbox: null,
+            frameW: m.width,
+            frameH: m.height,
+            confidence: m.match.confidence,
+            label: `“${m.match.text}”`,
+            subtitle: 'Text matched',
+            source: 'ocr'
+          };
 
-    if (matchedBox) {
+      stateRef.current.ocrMisses = 0;
       const cur = stateRef.current.matchedBox;
-      if (!cur || matchedBox.confidence > cur.confidence) {
+      if (matchedBox.bbox && (!cur || matchedBox.confidence >= cur.confidence)) {
         stateRef.current.matchedBox = matchedBox;
         trackerRef.current.update(matchedBox.bbox);
       }
-      maybeRaiseMatch(matchedBox);
-    } else {
-      maybeRaiseMatch({
-        bbox: null,
-        frameW: m.width,
-        frameH: m.height,
-        confidence: m.match.confidence,
-        label: `“${m.match.text}”`,
-        subtitle: 'Text matched',
-        source: 'ocr'
+      setMatch((prev) => {
+        if (!prev) return matchedBox;
+        if (prev.source === 'ocr' || matchedBox.confidence > prev.confidence) return matchedBox;
+        return prev;
       });
+    } else {
+      stateRef.current.ocrMisses += 1;
+      maybeClearStaleMatch();
     }
+  }
+
+  // If the active source has missed for more than MAX_MISSES consecutive
+  // scans, clear the match panel and the on-canvas matched box.
+  function maybeClearStaleMatch() {
+    setMatch((prev) => {
+      if (!prev) return prev;
+      const misses =
+        prev.source === 'ocr'
+          ? stateRef.current.ocrMisses
+          : stateRef.current.objectMisses;
+      if (misses > MAX_MISSES) {
+        if (
+          stateRef.current.matchedBox &&
+          stateRef.current.matchedBox.source === prev.source
+        ) {
+          stateRef.current.matchedBox = null;
+        }
+        return null;
+      }
+      return prev;
+    });
   }
 
   function prettyLabel(obj, targetColors) {
@@ -231,17 +276,7 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
     return `${color}${obj.class}`;
   }
 
-  function maybeRaiseMatch(box) {
-    if (pausedRef.current) return;
-    setMatch((prev) => {
-      if (prev && prev.confidence >= box.confidence) return prev;
-      return box;
-    });
-    setPaused(true);
-  }
-
   function maybeDispatch() {
-    if (pausedRef.current) return;
     const video = videoRef.current;
     if (!video || video.readyState < 2) return;
     const now = performance.now();
@@ -272,6 +307,7 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
     if (wantOcr && !ocrBusyRef.current && !ocrLoading && now - lastOcrRef.current > ocrInterval) {
       lastOcrRef.current = now;
       ocrBusyRef.current = true;
+      setOcrStatus('processing');
       grabOcrBitmap(video, ocrMode).then((bm) => {
         if (!bm) { ocrBusyRef.current = false; return; }
         ocr.postMessage({
@@ -286,7 +322,6 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
           bitmapScale: bm.bitmapScale,
           originalW: bm.originalW,
           originalH: bm.originalH,
-          // PSM 7 (single-line) for cropped label scans, 11 (sparse) for full frame.
           psm: ocrMode === 'accurate' ? '11' : '7'
         }, [bm.bitmap]);
       });
@@ -308,9 +343,6 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
     }
   }
 
-  // For Fast OCR mode, crop to the center 60% × 70% of the frame before
-  // sending to Tesseract. ~58% fewer pixels → proportionally faster recognize.
-  // Accurate mode passes the full frame (downscaled).
   async function grabOcrBitmap(video, mode) {
     if (!video.videoWidth) return null;
     const fullW = video.videoWidth;
@@ -329,7 +361,6 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
           bitmap: bm,
           cropOffsetX: 0,
           cropOffsetY: 0,
-          // bitmap pixels → original-frame pixels (uniform scale).
           bitmapScale: fullW / sw,
           originalW: fullW,
           originalH: fullH
@@ -337,7 +368,7 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
       } catch { return null; }
     }
 
-    // Fast mode: center crop, then optional downscale of the crop.
+    // Fast mode: center crop.
     const cropW = Math.max(1, Math.floor(fullW * CROP_W_FRACTION));
     const cropH = Math.max(1, Math.floor(fullH * CROP_H_FRACTION));
     const cropX = Math.floor((fullW - cropW) / 2);
@@ -355,12 +386,26 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
         bitmap: bm,
         cropOffsetX: cropX,
         cropOffsetY: cropY,
-        // bbox_in_original = bbox_in_bitmap * bitmapScale + cropOffset
         bitmapScale: cropW / targetW,
         originalW: fullW,
         originalH: fullH
       };
     } catch { return null; }
+  }
+
+  // Translate ocrStatus driven by ocrBusyRef + recent detection flash on
+  // each render-loop frame so the indicator reflects live activity.
+  function updateOcrStatus(now) {
+    const wantOcr = session.mode === 'label' || session.mode === 'auto';
+    let next = 'idle';
+    if (!wantOcr) {
+      next = 'idle';
+    } else if (now < stateRef.current.detectedFlashUntil) {
+      next = 'detected';
+    } else if (ocrBusyRef.current) {
+      next = 'processing';
+    }
+    setOcrStatus((prev) => (prev === next ? prev : next));
   }
 
   function drawFrame() {
@@ -380,7 +425,6 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
 
     if (!video.videoWidth) return;
 
-    // Compute the projection (object-fit: cover) from video → canvas.
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     const scale = Math.max(cssW / vw, cssH / vh);
@@ -398,8 +442,9 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
 
     const matched = stateRef.current.matchedBox;
     const wantOcr = session.mode === 'label' || session.mode === 'auto';
+    const tNow = performance.now();
 
-    // Viewfinder (only in Fast OCR mode while OCR is active).
+    // ─── Viewfinder scanning zone (Fast OCR only) ───
     let viewfinder = null;
     if (wantOcr && ocrMode === 'fast') {
       const vfFullW = vw * CROP_W_FRACTION;
@@ -409,57 +454,47 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
       const [vx, vy, vwid, vhei] = project([vfFullX, vfFullY, vfFullW, vfFullH], vw, vh);
       viewfinder = { x: vx, y: vy, w: vwid, h: vhei };
 
-      // Dim outside, clear inside, via even-odd path.
-      const radius = 18;
+      const radius = 20;
       ctx.save();
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.32)';
+      // Outside-the-box dim, inside fully clear (even-odd fill).
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
       ctx.beginPath();
       ctx.rect(0, 0, cssW, cssH);
-      if (typeof ctx.roundRect === 'function') {
-        ctx.roundRect(viewfinder.x, viewfinder.y, viewfinder.w, viewfinder.h, radius);
-      } else {
-        roundedRectPath(ctx, viewfinder.x, viewfinder.y, viewfinder.w, viewfinder.h, radius);
-      }
+      tracePath(ctx, viewfinder.x, viewfinder.y, viewfinder.w, viewfinder.h, radius);
       ctx.fill('evenodd');
 
-      // Viewfinder border.
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
-      ctx.lineWidth = 1.5;
+      // Border 2px solid white at 0.7 opacity.
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+      ctx.lineWidth = 2;
       ctx.beginPath();
-      if (typeof ctx.roundRect === 'function') {
-        ctx.roundRect(viewfinder.x, viewfinder.y, viewfinder.w, viewfinder.h, radius);
-      } else {
-        roundedRectPath(ctx, viewfinder.x, viewfinder.y, viewfinder.w, viewfinder.h, radius);
-      }
+      tracePath(ctx, viewfinder.x, viewfinder.y, viewfinder.w, viewfinder.h, radius);
       ctx.stroke();
 
-      // Corner marks.
-      const corner = 18;
-      ctx.strokeStyle = '#29c2ff';
-      ctx.lineWidth = 3;
-      drawCorners(ctx, viewfinder, corner);
+      // L-shaped corner accents — bright white, 20px each, animated pulse.
+      const cornerLen = 20;
+      const pulse = 0.6 + 0.4 * (0.5 + 0.5 * Math.sin(tNow / 1000 * 2 * Math.PI));
+      ctx.strokeStyle = `rgba(255, 255, 255, ${pulse})`;
+      ctx.lineWidth = 4;
+      ctx.lineCap = 'round';
+      drawCornerBrackets(ctx, viewfinder, cornerLen);
       ctx.restore();
     }
 
-    // OCR words: thin blue underline to show OCR is actively reading.
+    // ─── Live word rectangles (OCR feedback) ───
     if (wantOcr && stateRef.current.ocrWords.length) {
       ctx.save();
-      ctx.strokeStyle = '#29c2ff';
-      ctx.lineWidth = 2;
-      ctx.shadowColor = 'rgba(41, 194, 255, 0.6)';
-      ctx.shadowBlur = 4;
-      for (const wd of stateRef.current.ocrWords.slice(0, 40)) {
+      ctx.fillStyle = 'rgba(41, 194, 255, 0.30)';
+      for (const wd of stateRef.current.ocrWords.slice(0, 60)) {
         const [x, y, w, h] = project(wd.bbox, vw, vh);
-        if (w < 6 || h < 6) continue;
-        ctx.beginPath();
-        ctx.moveTo(x + 1, y + h - 1);
-        ctx.lineTo(x + w - 1, y + h - 1);
-        ctx.stroke();
+        if (w < 4 || h < 4) continue;
+        // Skip if it's the matched word (drawn in green below).
+        if (matched && matched.bbox && sameBox(wd.bbox, matched.bbox)) continue;
+        ctx.fillRect(x, y, w, h);
       }
       ctx.restore();
     }
 
-    // Object boxes (yellow).
+    // ─── Object boxes (yellow) ───
     ctx.lineWidth = 2;
     ctx.strokeStyle = '#ffcc33';
     ctx.fillStyle = 'rgba(255, 204, 51, 0.05)';
@@ -478,20 +513,22 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
       ctx.fillStyle = 'rgba(255, 204, 51, 0.05)';
     }
 
-    // Matched box — pulsing green glow. OCR matches pulse extra-bright.
+    // ─── Matched box: pulsing green glow (1 Hz opacity pulse) ───
     if (matched && matched.bbox) {
-      const t = performance.now() / 1000;
-      const pulse = 0.55 + 0.45 * Math.sin(t * 6.28); // 1 Hz pulse
+      const phase = 0.5 + 0.5 * Math.sin(tNow / 1000 * 2 * Math.PI);
+      const fillAlpha = 0.10 + 0.18 * phase;
+      const strokeAlpha = 0.65 + 0.35 * phase;
       const [x, y, w, h] = project(matched.bbox, matched.frameW || vw, matched.frameH || vh);
       ctx.save();
       ctx.shadowColor = '#39ff88';
-      ctx.shadowBlur = 18 + pulse * 22;
-      ctx.lineWidth = 3 + pulse * 2;
-      ctx.strokeStyle = '#39ff88';
-      ctx.fillStyle = `rgba(57, 255, 136, ${0.08 + pulse * 0.1})`;
+      ctx.shadowBlur = 18 + phase * 22;
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = `rgba(57, 255, 136, ${strokeAlpha})`;
+      ctx.fillStyle = `rgba(57, 255, 136, ${fillAlpha})`;
       ctx.fillRect(x, y, w, h);
       ctx.strokeRect(x, y, w, h);
       ctx.restore();
+      // Label badge (no pulse).
       ctx.fillStyle = '#39ff88';
       ctx.font = '700 13px -apple-system, system-ui, sans-serif';
       const label = `${matched.label} ${(matched.confidence * 100).toFixed(0)}%`;
@@ -511,13 +548,15 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
 
     // FPS sampling
     stateRef.current.drawCount++;
-    const now = performance.now();
-    if (now - stateRef.current.lastDrawT > 500) {
-      const f = (stateRef.current.drawCount * 1000) / (now - stateRef.current.lastDrawT);
-      stateRef.current.lastDrawT = now;
+    if (tNow - stateRef.current.lastDrawT > 500) {
+      const f = (stateRef.current.drawCount * 1000) / (tNow - stateRef.current.lastDrawT);
+      stateRef.current.lastDrawT = tNow;
       stateRef.current.drawCount = 0;
       setFps(Math.round(f));
     }
+
+    // Update OCR status indicator on the HUD.
+    updateOcrStatus(tNow);
   }
 
   function sameBox(a, b) {
@@ -544,6 +583,7 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
         locked={!!match}
         ocrMode={ocrMode}
         ocrLoading={ocrLoading}
+        ocrStatus={ocrStatus}
         onToggleOcrMode={toggleOcrMode}
         showOcrToggle={session.mode === 'label' || session.mode === 'auto'}
       />
@@ -575,30 +615,31 @@ export default function CameraView({ session, vision, ocr, onExit, onSessionChan
 
       <MatchSheet
         match={match}
-        onResume={() => {
-          setMatch(null);
-          setPaused(false);
-        }}
+        onResume={() => setMatch(null)}
         onDone={onExit}
       />
     </div>
   );
 }
 
-function roundedRectPath(ctx, x, y, w, h, r) {
-  const rr = Math.min(r, w / 2, h / 2);
-  ctx.moveTo(x + rr, y);
-  ctx.lineTo(x + w - rr, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
-  ctx.lineTo(x + w, y + h - rr);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
-  ctx.lineTo(x + rr, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
-  ctx.lineTo(x, y + rr);
-  ctx.quadraticCurveTo(x, y, x + rr, y);
+function tracePath(ctx, x, y, w, h, r) {
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(x, y, w, h, r);
+  } else {
+    const rr = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + rr, y);
+    ctx.lineTo(x + w - rr, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+    ctx.lineTo(x + w, y + h - rr);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    ctx.lineTo(x + rr, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+    ctx.lineTo(x, y + rr);
+    ctx.quadraticCurveTo(x, y, x + rr, y);
+  }
 }
 
-function drawCorners(ctx, vf, len) {
+function drawCornerBrackets(ctx, vf, len) {
   const { x, y, w, h } = vf;
   ctx.beginPath();
   // Top-left

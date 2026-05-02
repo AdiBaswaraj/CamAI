@@ -13,6 +13,7 @@ export default function HUD({
   locked,
   ocrMode,
   ocrLoading,
+  ocrStatus,
   showOcrToggle,
   onToggleOcrMode
 }) {
@@ -26,10 +27,18 @@ export default function HUD({
       <div className="hud-info">
         <div className="hud-target">{target || 'Scanning…'}</div>
         <div className="hud-meta">
-          <span className="hud-pill">{MODE_LABEL[session.mode]}</span>
-          <span className="hud-pill">{t.label} · {t.pct}%</span>
-          <span className="hud-pill lock">🔒 ON-DEVICE</span>
-          {locked && <span className="hud-pill lock">LOCKED</span>}
+          <span className="hud-pill pill-mode">{MODE_LABEL[session.mode]}</span>
+          <span className="hud-pill pill-thresh">{t.label} · {t.pct}%</span>
+          <span className="hud-pill lock pill-privacy">
+            🔒 ON-DEVICE
+            {showOcrToggle && (
+              <span
+                className={`status-dot ${ocrStatus || 'idle'}`}
+                aria-label={`OCR ${ocrStatus || 'idle'}`}
+              />
+            )}
+          </span>
+          <span className={`hud-pill pill-locked ${locked ? 'is-on' : ''}`}>LOCKED</span>
         </div>
       </div>
       {showOcrToggle && (
@@ -39,7 +48,7 @@ export default function HUD({
           disabled={ocrLoading}
           aria-label="Toggle OCR engine"
         >
-          {ocrLoading ? '…' : (ocrMode === 'fast' ? 'Fast' : 'Accurate')}
+          {ocrLoading ? '…' : (ocrMode === 'fast' ? '⚡ Fast' : '🎯 Accurate')}
         </button>
       )}
     </div>
